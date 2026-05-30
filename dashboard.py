@@ -221,11 +221,21 @@ def _run_qwen_bg(logs_snapshot: list, model: str) -> None:
     finally:
         _ai_state["running"] = False  # garante reset mesmo em caso de exceção
 
-# Chama imediatamente se chegaram muitos logs novos (ataque) ou a cada 15s no normal
+# Detecta padrão de falso positivo nos logs recentes para acionar a IA imediatamente.
+# O simulador injeta apenas 3 logs (new_logs_delta <= 3), então o trigger > 8 nunca dispara.
+_recent10 = logs[-10:] if logs else []
+_fp_hits   = sum(
+    1 for r in _recent10
+    if r.get("endpoint") == "/login" and r.get("status_code") == 401
+)
+has_fp_pattern = _fp_hits >= 2
+
+# Chama imediatamente se: ataque (muitos logs), falso positivo detectado, ou ciclo normal de 15s
 should_call = (
     qwen_model
     and estado == "NORMAL"
-    and (elapsed_qwen >= 15 or new_logs_delta > 8)
+    and not _ai_state["running"]
+    and (elapsed_qwen >= 15 or new_logs_delta > 8 or has_fp_pattern)
 )
 if should_call:
     with _ai_lock:

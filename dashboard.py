@@ -341,58 +341,60 @@ if bg:
 """, unsafe_allow_html=True)
 
 # ── conteúdo principal ────────────────────────────────────────────────────────
-st.markdown(
-    "<h2 style='color:#58a6ff;margin-bottom:4px;'>🛡️ Centro de Operações de Segurança</h2>",
-    unsafe_allow_html=True,
-)
+_main = st.empty()
+with _main.container():
+    st.markdown(
+        "<h2 style='color:#58a6ff;margin-bottom:4px;'>🛡️ Centro de Operações de Segurança</h2>",
+        unsafe_allow_html=True,
+    )
 
-col_chart, col_badge = st.columns([4, 1])
+    col_chart, col_badge = st.columns([4, 1])
 
-with col_chart:
-    st.subheader("Requisições por Segundo")
-    st.line_chart(st.session_state.requests_per_second, height=200)
+    with col_chart:
+        st.subheader("Requisições por Segundo")
+        st.line_chart(st.session_state.requests_per_second, height=200)
 
-with col_badge:
-    st.subheader("Análise da IA")
-    result = st.session_state.qwen_result
-    if _ai["running"]:
-        st.info("⏳ Analisando...")
-    elif "ATAQUE" in result:
-        st.error(f"🤖 {result}")
-    elif "FALSO_POSITIVO" in result:
-        st.warning(f"🤖 {result}")
-    elif result.startswith("Erro"):
-        st.warning(f"🤖 {result}")
-    else:
-        st.info("🤖 Monitorando...")
-
-    st.caption(f"Modelo: {qwen_model}")
-
-st.divider()
-
-# ── tabela de logs ────────────────────────────────────────────────────────────
-st.subheader("Últimos Logs")
-if logs:
-    display = []
-    for row in reversed(logs[-50:]):
-        tipo = row.get("tipo", "normal")
-        if tipo == "ataque":
-            ip_cell = f"🔴 {row['ip']}"
-        elif tipo == "falso_positivo":
-            ip_cell = f"🟡 {row['ip']}"
+    with col_badge:
+        st.subheader("Análise da IA")
+        result = st.session_state.qwen_result
+        if _ai["running"]:
+            st.info("⏳ Analisando...")
+        elif "ATAQUE" in result:
+            st.error(f"🤖 {result}")
+        elif "FALSO_POSITIVO" in result:
+            st.warning(f"🤖 {result}")
+        elif result.startswith("Erro"):
+            st.warning(f"🤖 {result}")
         else:
-            ip_cell = row["ip"]
-        display.append({
-            "Timestamp":  row["timestamp"][11:19],
-            "IP":         ip_cell,
-            "Método":     row["method"],
-            "Endpoint":   row["endpoint"],
-            "Status":     row["status_code"],
-            "Resp (ms)":  row["response_time_ms"],
-        })
-    st.dataframe(display, use_container_width=True, height=380)
-else:
-    st.info("Nenhum log ainda. A API está rodando em localhost:8000?")
+            st.info("🤖 Monitorando...")
+
+        st.caption(f"Modelo: {qwen_model}")
+
+    st.divider()
+
+    # ── tabela de logs ────────────────────────────────────────────────────────
+    st.subheader("Últimos Logs")
+    if logs:
+        display = []
+        for row in reversed(logs[-50:]):
+            tipo = row.get("tipo", "normal")
+            if tipo == "ataque":
+                ip_cell = f"🔴 {row['ip']}"
+            elif tipo == "falso_positivo":
+                ip_cell = f"🟡 {row['ip']}"
+            else:
+                ip_cell = row["ip"]
+            display.append({
+                "Timestamp":  row["timestamp"][11:19],
+                "IP":         ip_cell,
+                "Método":     row["method"],
+                "Endpoint":   row["endpoint"],
+                "Status":     row["status_code"],
+                "Resp (ms)":  row["response_time_ms"],
+            })
+        st.dataframe(display, use_container_width=True, height=380)
+    else:
+        st.info("Nenhum log ainda. A API está rodando em localhost:8000?")
 
 time.sleep(2)
 st.rerun()

@@ -22,9 +22,10 @@ app.add_middleware(
 log_queue: list[dict] = []
 
 system_state: dict = {
-    "estado": "NORMAL",
+    "estado":     "NORMAL",
     "ip_bloqueado": None,
-    "mensagem": "",
+    "mensagem":   "",
+    "ai_trigger": False,
 }
 
 # Modelo Qwen (LM Studio) armazenado em memória (definido pelo controle.py)
@@ -112,12 +113,13 @@ def set_state(
     return {"ok": True}
 
 
-# ── Simulações — apenas injetam logs, NÃO alteram system_state ─────────────
+# ── Simulações ───────────────────────────────────────────────────────────────
 @app.get("/attack")
 def simulate_attack() -> dict:
     attacker_ip = "185.220.101.45"
     for _ in range(50):
         _push(_make_log(attacker_ip, "POST", "/admin/login", 401, "ataque"))
+    system_state["ai_trigger"] = True
     return {"injected": 50, "ip": attacker_ip}
 
 
@@ -127,7 +129,14 @@ async def simulate_false_positive() -> dict:
     for _ in range(3):
         _push(_make_log(human_ip, "POST", "/login", 401, "falso_positivo"))
         await asyncio.sleep(2)
+    system_state["ai_trigger"] = True
     return {"injected": 3, "ip": human_ip}
+
+
+@app.get("/clear-trigger")
+def clear_trigger() -> dict:
+    system_state["ai_trigger"] = False
+    return {"ok": True}
 
 
 @app.get("/reset")
@@ -136,6 +145,7 @@ def reset_logs() -> dict:
     system_state["estado"]       = "NORMAL"
     system_state["ip_bloqueado"] = None
     system_state["mensagem"]     = ""
+    system_state["ai_trigger"]   = False
     return {"status": "cleared"}
 
 

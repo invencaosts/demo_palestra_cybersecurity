@@ -11,16 +11,23 @@ import streamlit as st
 
 API_BASE = os.environ.get("API_URL", "http://localhost:8000")
 
-# Estado global do thread de IA — compartilhado entre todos os reruns/sessões do Streamlit.
-# st.session_state não é confiável em threads de background (missing ScriptRunContext).
-_ai_lock  = threading.Lock()
-_ai_state: dict = {
-    "running":   False,
-    "result":    None,
-    "last_call": time.time(),  # compartilhado entre todas as sessões/abas
-}
-
 st.set_page_config(layout="wide", page_title="SOC - Centro de Operações")
+
+@st.cache_resource
+def _ai_globals() -> dict:
+    # cache_resource persiste entre reruns e sessões — o código de módulo é
+    # re-executado a cada rerun, então Lock() e _ai_state criados no topo
+    # do script seriam recriados a cada 2s, zerando running=False e
+    # destruindo o mecanismo de lock.
+    return {
+        "lock":      threading.Lock(),
+        "running":   False,
+        "result":    None,
+        "last_call": time.time(),
+        "epoch":     0,   # incrementado a cada reset — descarta resultados de threads antigas
+    }
+
+_ai = _ai_globals()
 
 st.markdown("""
 <style>
@@ -37,7 +44,7 @@ st.markdown("""
 for key, default in [
     ("requests_per_second", []),
     ("qwen_result",         "Monitorando..."),
-    ("last_log_count",      0),
+    ("last_log_count",      None),   # None = não inicializado; será preenchido após 1ª busca
     ("last_tick",           time.time()),
 ]:
     if key not in st.session_state:
@@ -115,6 +122,8 @@ def _extract_json_verdict(content: str) -> dict | None:
 
 
 def analisar_com_qwen(logs: list[dict], model: str) -> str:
+    start_epoch = _ai["epoch"]   # captura epoch no início — mudança indica reset
+
     try:
         from openai import OpenAI  # type: ignore
 
@@ -123,48 +132,62 @@ def analisar_com_qwen(logs: list[dict], model: str) -> str:
             api_key="lm-studio",
         )
 
-        # Campos mínimos — UUID/response_time/tipo não ajudam na detecção e inflam o prompt
         def _slim(r: dict) -> dict:
             return {
                 "ip":       r["ip"],
                 "method":   r["method"],
                 "endpoint": r["endpoint"],
                 "status":   r["status_code"],
-                "time":     r["timestamp"][11:19],  # apenas HH:MM:SS
+                "time":     r["timestamp"][11:19],
             }
 
-        recent = logs[-5:]
-        has_attack_pattern = sum(
-            1 for r in recent
-            if r.get("endpoint") == "/admin/login" and r.get("status_code") == 401
-        ) >= 2
-        sample = [_slim(r) for r in (logs[-15:] if has_attack_pattern else recent)]
+        # 5 logs são suficientes para o padrão "3+ = ATAQUE/FP".
+        # Com 15 logs o modelo gastava 3000 tokens só em thinking e nunca escrevia JSON.
+        sample  = [_slim(r) for r in logs[-5:]]
+        payload = json.dumps(sample, ensure_ascii=False)
 
-        payload = json.dumps(sample, ensure_ascii=False)  # sem indent — menos tokens
+        content_buf   = ""
+        reasoning_buf = ""
 
-        response = client.chat.completions.create(
+        # Streaming permite cancelar a geração imediatamente quando o reset é clicado
+        with client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": f"Logs: {payload}"},
             ],
             temperature=0.1,
-            max_tokens=1024,
+            max_tokens=3000,
             timeout=120,
-        )
+            stream=True,
+        ) as stream:
+            for chunk in stream:
+                if _ai["epoch"] != start_epoch:
+                    # Reset clicado durante a análise — fecha conexão e para
+                    return "NORMAL"
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        content_buf += delta.content
+                    rc = getattr(delta, "reasoning_content", None)
+                    if rc:
+                        reasoning_buf += rc
 
-        msg      = response.choices[0].message
-        content  = msg.content or ""
-        # Qwen3 Thinking escreve o JSON dentro do reasoning_content quando o orçamento de tokens
-        # esgota antes do bloco <think> fechar — busca lá também como fallback
-        reasoning = getattr(msg, "reasoning_content", None) or ""
-        search_in = content or reasoning   # prefere content; usa reasoning se content vazio
-
-        result = _extract_json_verdict(search_in)
+        search_in = content_buf or reasoning_buf
+        result    = _extract_json_verdict(search_in)
 
         if result is None:
-            upper = search_in.upper()
-            veredicto = "ATAQUE" if "ATAQUE" in upper else ("FALSO_POSITIVO" if "FALSO" in upper else "NORMAL")
+            # Olha apenas os últimos 600 chars do reasoning — é onde o modelo conclui.
+            # rfind no texto inteiro é enganoso: o modelo discute todas as categorias
+            # antes de concluir (ex.: "ATAQUE não se aplica... FALSO_POSITIVO também não...
+            # portanto NORMAL"), e o fallback encontra a última menção, não a conclusão.
+            tail  = (search_in[-600:] if len(search_in) > 600 else search_in).upper()
+            pos   = {
+                "ATAQUE":         tail.rfind("ATAQUE"),
+                "FALSO_POSITIVO": tail.rfind("FALSO_POSITIVO"),
+                "NORMAL":         tail.rfind("NORMAL"),
+            }
+            veredicto = max(pos, key=lambda k: pos[k]) if any(v >= 0 for v in pos.values()) else "NORMAL"
             result = {"veredicto": veredicto, "ip": None, "motivo": ""}
 
         veredicto = result.get("veredicto", "NORMAL")
@@ -195,9 +218,32 @@ ip_bloqueado = status.get("ip_bloqueado") or "—"
 
 now               = time.time()
 current_log_count = len(logs)
-new_logs_delta    = max(current_log_count - st.session_state.last_log_count, 0)
 elapsed           = max(now - st.session_state.last_tick, 0.001)
-elapsed_qwen      = now - _ai_state["last_call"]  # global — evita chamadas duplicadas de múltiplas abas
+
+if st.session_state.last_log_count is None:
+    st.session_state.last_log_count = current_log_count
+
+new_logs_delta = max(current_log_count - st.session_state.last_log_count, 0)
+
+# ── Detecta Reset ────────────────────────────────────────────────────────────
+# Dois sinais independentes: queda abrupta no log_queue (reset clicado enquanto
+# a IA ainda analisa) OU transição de estado para NORMAL (reset após detecção).
+_prev_log   = st.session_state.get("_prev_log_count", current_log_count)
+_prev_estado = st.session_state.get("_prev_estado", estado)
+
+reset_detected = (
+    (_prev_log > 10 and current_log_count < 3)           # log_queue foi zerado
+    or (_prev_estado != "NORMAL" and estado == "NORMAL")  # saiu de ATAQUE/FP
+)
+st.session_state["_prev_log_count"] = current_log_count
+st.session_state["_prev_estado"]    = estado
+
+if reset_detected:
+    _ai["epoch"]    += 1   # sinaliza à thread de streaming para fechar conexão
+    _ai["running"]   = False
+    _ai["result"]    = None
+    _ai["last_call"] = time.time()
+    st.session_state.qwen_result = "Monitorando..."
 
 # req/s
 rps = round(new_logs_delta / elapsed, 2)
@@ -210,41 +256,39 @@ st.session_state.last_tick      = now
 # ── Qwen (LM Studio) — núcleo do sistema ────────────────────────────────────
 qwen_model = get_qwen_model()
 
-# Propaga resultado da thread para o session state (operação segura na thread principal)
-if _ai_state["result"] is not None:
-    st.session_state.qwen_result = _ai_state["result"]
-    _ai_state["result"] = None
+if _ai["result"] is not None:
+    st.session_state.qwen_result = _ai["result"]
+    _ai["result"] = None
 
-def _run_qwen_bg(logs_snapshot: list, model: str) -> None:
+def _run_qwen_bg(logs_snapshot: list, model: str, epoch: int) -> None:
     try:
-        _ai_state["result"] = analisar_com_qwen(logs_snapshot, model)
+        result = analisar_com_qwen(logs_snapshot, model)
+        if _ai["epoch"] == epoch:
+            _ai["result"] = result
     finally:
-        _ai_state["running"] = False  # garante reset mesmo em caso de exceção
+        if _ai["epoch"] == epoch:
+            _ai["running"]   = False
+            _ai["last_call"] = time.time()  # reseta timer após terminar — evita loop imediato
 
-# Detecta padrão de falso positivo nos logs recentes para acionar a IA imediatamente.
-# O simulador injeta apenas 3 logs (new_logs_delta <= 3), então o trigger > 8 nunca dispara.
-_recent10 = logs[-10:] if logs else []
-_fp_hits   = sum(
-    1 for r in _recent10
-    if r.get("endpoint") == "/login" and r.get("status_code") == 401
-)
-has_fp_pattern = _fp_hits >= 2
-
-# Chama imediatamente se: ataque (muitos logs), falso positivo detectado, ou ciclo normal de 15s
+# A IA só analisa quando ataque ou falso positivo é simulado.
+# A API seta ai_trigger=True; o dashboard consome e despacha a thread.
 should_call = (
     qwen_model
-    and estado == "NORMAL"
-    and not _ai_state["running"]
-    and (elapsed_qwen >= 15 or new_logs_delta > 8 or has_fp_pattern)
+    and not _ai["running"]
+    and status.get("ai_trigger", False)
 )
 if should_call:
-    with _ai_lock:
-        if not _ai_state["running"]:   # double-check sob o lock evita threads duplicadas
-            _ai_state["running"]   = True
-            _ai_state["last_call"] = now
+    with _ai["lock"]:
+        if not _ai["running"] and status.get("ai_trigger", False):
+            _ai["running"]   = True
+            _ai["last_call"] = now
+            try:
+                requests.get(f"{API_BASE}/clear-trigger", timeout=2)
+            except Exception:
+                pass
             threading.Thread(
                 target=_run_qwen_bg,
-                args=(list(logs), qwen_model),
+                args=(list(logs), qwen_model, _ai["epoch"]),
                 daemon=True,
             ).start()
 
@@ -311,7 +355,7 @@ with col_chart:
 with col_badge:
     st.subheader("Análise da IA")
     result = st.session_state.qwen_result
-    if _ai_state["running"]:
+    if _ai["running"]:
         st.info("⏳ Analisando...")
     elif "ATAQUE" in result:
         st.error(f"🤖 {result}")

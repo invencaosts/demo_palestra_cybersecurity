@@ -54,29 +54,28 @@ if st.button("🔄 RESETAR SISTEMA", use_container_width=True):
 
 st.divider()
 
-# ── configurar chave Gemini ───────────────────────────────────────────────────
-st.markdown("**🔑 Gemini API Key**")
-gemini_key_input = st.text_input(
-    "Chave",
-    type="password",
-    placeholder="Cole sua chave aqui",
+# ── configurar modelo Qwen (LM Studio) ───────────────────────────────────────
+st.markdown("**🤖 Modelo Qwen (LM Studio)**")
+qwen_model_input = st.text_input(
+    "Modelo",
+    placeholder="ex: qwen/qwen3-4b-thinking-2507",
     label_visibility="collapsed",
 )
-if st.button("Salvar chave", use_container_width=True):
-    if gemini_key_input.strip():
-        if call_api("/set-gemini-key", {"key": gemini_key_input.strip()}):
-            st.toast("Chave salva com sucesso!", icon="🔑")
+if st.button("Salvar modelo", use_container_width=True):
+    if qwen_model_input.strip():
+        if call_api("/set-qwen-model", {"model": qwen_model_input.strip()}):
+            st.toast("Modelo salvo com sucesso!", icon="🤖")
     else:
-        st.toast("Digite uma chave antes de salvar.", icon="⚠️")
+        st.toast("Digite o nome do modelo antes de salvar.", icon="⚠️")
 
-# indicador de chave ativa
+# indicador de modelo ativo
 try:
-    r = requests.get(f"{API_URL}/get-gemini-key", timeout=3)
-    key_set = bool(r.json().get("key", ""))
+    r = requests.get(f"{API_URL}/get-qwen-model", timeout=3)
+    current_model = r.json().get("model", "")
 except Exception:
-    key_set = False
+    current_model = ""
 
-st.caption("🟢 Chave ativa" if key_set else "🔴 Chave não definida")
+st.caption(f"🟢 Modelo ativo: {current_model}" if current_model else "🔴 Modelo não definido")
 
 st.divider()
 

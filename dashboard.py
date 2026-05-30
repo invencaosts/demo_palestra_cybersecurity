@@ -1,14 +1,24 @@
-# dependencies: streamlit requests google-generativeai
+# dependencies: streamlit requests openai
 
 import os
 import re
 import time
 import json
+import threading
 
 import requests
 import streamlit as st
 
 API_BASE = os.environ.get("API_URL", "http://localhost:8000")
+
+# Estado global do thread de IA — compartilhado entre todos os reruns/sessões do Streamlit.
+# st.session_state não é confiável em threads de background (missing ScriptRunContext).
+_ai_lock  = threading.Lock()
+_ai_state: dict = {
+    "running":   False,
+    "result":    None,
+    "last_call": time.time(),  # compartilhado entre todas as sessões/abas
+}
 
 st.set_page_config(layout="wide", page_title="SOC - Centro de Operações")
 
@@ -26,8 +36,7 @@ st.markdown("""
 # ── session state ────────────────────────────────────────────────────────────
 for key, default in [
     ("requests_per_second", []),
-    ("last_gemini_call",    0.0),
-    ("gemini_result",       "Monitorando..."),
+    ("qwen_result",         "Monitorando..."),
     ("last_log_count",      0),
     ("last_tick",           time.time()),
 ]:
@@ -54,81 +63,114 @@ def fetch_status() -> dict:
         return {"estado": "NORMAL", "ip_bloqueado": None, "mensagem": ""}
 
 
-def get_gemini_key() -> str:
+def get_qwen_model() -> str:
     """Tenta env var primeiro, depois busca da API (definida pelo controle.py)."""
-    key = os.environ.get("GEMINI_API_KEY", "")
-    if key:
-        return key
+    model = os.environ.get("QWEN_MODEL", "")
+    if model:
+        return model
     try:
-        r = requests.get(f"{API_BASE}/get-gemini-key", timeout=2)
-        return r.json().get("key", "")
+        r = requests.get(f"{API_BASE}/get-qwen-model", timeout=2)
+        return r.json().get("model", "qwen/qwen3-4b-thinking-2507")
     except Exception:
-        return ""
+        return "qwen/qwen3-4b-thinking-2507"
 
 
-# ── PROMPT COM TREINAMENTO (few-shot) ────────────────────────────────────────
-SYSTEM_PROMPT = """Você é um sistema especialista em detecção de ameaças cibernéticas.
-Analise os logs de acesso abaixo e classifique o padrão observado.
+def get_lmstudio_base_url() -> str:
+    return os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
 
-REGRAS DE CLASSIFICAÇÃO:
 
-1. ATAQUE — indique quando observar:
-   - Mesmo IP com 10 ou mais requisições consecutivas em menos de 60 segundos
-   - Múltiplas tentativas de acesso a endpoints sensíveis como /admin/login com status 401
-   - Volume anômalo de requisições POST com falha vindo de um único IP externo
-   Exemplo de padrão de ATAQUE:
-   [{"ip":"185.220.101.45","method":"POST","endpoint":"/admin/login","status_code":401},
-    {"ip":"185.220.101.45","method":"POST","endpoint":"/admin/login","status_code":401},
-    ... (repetido 10+ vezes em segundos)]
+# ── PROMPT OBJETIVO (evita raciocínio excessivo no modelo Thinking) ──────────
+SYSTEM_PROMPT = """Classifique os logs de acesso como ATAQUE, FALSO_POSITIVO ou NORMAL.
 
-2. FALSO_POSITIVO — indique quando observar:
-   - Mesmo IP com apenas 2 a 5 tentativas de login com status 401
-   - Intervalo de tempo lento entre as tentativas (comportamento humano, não robótico)
-   - Endpoint /login (não /admin/login) com poucas tentativas
-   Exemplo de padrão de FALSO_POSITIVO:
-   [{"ip":"192.168.1.10","method":"POST","endpoint":"/login","status_code":401},
-    (pausa de ~2s)
-    {"ip":"192.168.1.10","method":"POST","endpoint":"/login","status_code":401},
-    (pausa de ~2s)
-    {"ip":"192.168.1.10","method":"POST","endpoint":"/login","status_code":401}]
+ATAQUE: mesmo IP fez 3+ requisições POST em /admin/login com status 401 em sequência (timestamps próximos = comportamento de bot).
+FALSO_POSITIVO: mesmo IP fez tentativas em /login (não /admin/login) com pausas longas entre elas (intervalo >1s = comportamento humano).
+NORMAL: IPs variados, endpoints diversos, sem concentração de falhas num único IP.
 
-3. NORMAL — indique quando observar:
-   - IPs variados fazendo requisições diversas
-   - Mix de métodos GET/POST em endpoints comuns
-   - Sem concentração de erros num único IP
-
-Responda APENAS com JSON no formato exato (sem markdown, sem texto extra):
-{"veredicto": "NORMAL" | "ATAQUE" | "FALSO_POSITIVO", "ip": "IP suspeito ou null", "motivo": "uma frase curta em português"}
+Responda SOMENTE com este JSON (sem markdown, sem explicação):
+{"veredicto": "NORMAL" | "ATAQUE" | "FALSO_POSITIVO", "ip": "IP suspeito ou null", "motivo": "frase curta em português"}
 """
 
 
-def analisar_com_gemini(logs: list[dict], api_key: str) -> str:
-    try:
-        import google.generativeai as genai  # type: ignore
+def _extract_json_verdict(content: str) -> dict | None:
+    """Procura JSON com 'veredicto' no conteúdo — inclusive dentro de blocos <think>."""
+    candidates = []
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            "gemini-1.5-flash",
-            system_instruction=SYSTEM_PROMPT,
+    # 1. texto limpo após remover blocos think
+    clean = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    clean = re.sub(r"```(?:json)?\s*", "", clean).strip()
+    if clean:
+        candidates.append(clean)
+
+    # 2. JSON embutido em qualquer lugar do conteúdo bruto (inclusive dentro de <think>)
+    for m in re.finditer(r'\{[^{}]*"veredicto"[^{}]*\}', content, re.DOTALL):
+        candidates.append(m.group())
+
+    for text in candidates:
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return None
+
+
+def analisar_com_qwen(logs: list[dict], model: str) -> str:
+    try:
+        from openai import OpenAI  # type: ignore
+
+        client = OpenAI(
+            base_url=get_lmstudio_base_url(),
+            api_key="lm-studio",
         )
 
-        payload = json.dumps(logs[-15:], ensure_ascii=False, indent=2)
-        prompt  = f"Analise estes logs e classifique:\n{payload}"
+        # Campos mínimos — UUID/response_time/tipo não ajudam na detecção e inflam o prompt
+        def _slim(r: dict) -> dict:
+            return {
+                "ip":       r["ip"],
+                "method":   r["method"],
+                "endpoint": r["endpoint"],
+                "status":   r["status_code"],
+                "time":     r["timestamp"][11:19],  # apenas HH:MM:SS
+            }
 
-        response = model.generate_content(prompt)
-        text = response.text.strip()
+        recent = logs[-5:]
+        has_attack_pattern = sum(
+            1 for r in recent
+            if r.get("endpoint") == "/admin/login" and r.get("status_code") == 401
+        ) >= 2
+        sample = [_slim(r) for r in (logs[-15:] if has_attack_pattern else recent)]
 
-        # Remove possíveis blocos markdown que o modelo insira mesmo assim
-        text = re.sub(r"```json\s*", "", text)
-        text = re.sub(r"```\s*",     "", text)
-        text = text.strip()
+        payload = json.dumps(sample, ensure_ascii=False)  # sem indent — menos tokens
 
-        result   = json.loads(text)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": f"Logs: {payload}"},
+            ],
+            temperature=0.1,
+            max_tokens=1024,
+            timeout=120,
+        )
+
+        msg      = response.choices[0].message
+        content  = msg.content or ""
+        # Qwen3 Thinking escreve o JSON dentro do reasoning_content quando o orçamento de tokens
+        # esgota antes do bloco <think> fechar — busca lá também como fallback
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+        search_in = content or reasoning   # prefere content; usa reasoning se content vazio
+
+        result = _extract_json_verdict(search_in)
+
+        if result is None:
+            upper = search_in.upper()
+            veredicto = "ATAQUE" if "ATAQUE" in upper else ("FALSO_POSITIVO" if "FALSO" in upper else "NORMAL")
+            result = {"veredicto": veredicto, "ip": None, "motivo": ""}
+
         veredicto = result.get("veredicto", "NORMAL")
         ip        = result.get("ip") or ""
         motivo    = result.get("motivo", "")
 
-        # IA aciona o alerta diretamente
         if veredicto in ("ATAQUE", "FALSO_POSITIVO"):
             try:
                 requests.get(
@@ -140,15 +182,6 @@ def analisar_com_gemini(logs: list[dict], api_key: str) -> str:
                 pass
 
         return veredicto
-
-    except json.JSONDecodeError:
-        # Gemini às vezes retorna texto livre; tenta extrair a palavra-chave
-        text_upper = response.text.upper() if 'response' in dir() else ""
-        if "ATAQUE" in text_upper:
-            return "ATAQUE"
-        if "FALSO" in text_upper:
-            return "FALSO_POSITIVO"
-        return "NORMAL"
 
     except Exception as exc:
         return f"Erro: {exc}"
@@ -164,7 +197,7 @@ now               = time.time()
 current_log_count = len(logs)
 new_logs_delta    = max(current_log_count - st.session_state.last_log_count, 0)
 elapsed           = max(now - st.session_state.last_tick, 0.001)
-elapsed_gemini    = now - st.session_state.last_gemini_call
+elapsed_qwen      = now - _ai_state["last_call"]  # global — evita chamadas duplicadas de múltiplas abas
 
 # req/s
 rps = round(new_logs_delta / elapsed, 2)
@@ -174,18 +207,36 @@ if len(st.session_state.requests_per_second) > 60:
 st.session_state.last_log_count = current_log_count
 st.session_state.last_tick      = now
 
-# ── Gemini — núcleo do sistema ────────────────────────────────────────────────
-gemini_key = get_gemini_key()
+# ── Qwen (LM Studio) — núcleo do sistema ────────────────────────────────────
+qwen_model = get_qwen_model()
 
-# Chama imediatamente se chegaram muitos logs novos (ataque) ou a cada 4s no normal
+# Propaga resultado da thread para o session state (operação segura na thread principal)
+if _ai_state["result"] is not None:
+    st.session_state.qwen_result = _ai_state["result"]
+    _ai_state["result"] = None
+
+def _run_qwen_bg(logs_snapshot: list, model: str) -> None:
+    try:
+        _ai_state["result"] = analisar_com_qwen(logs_snapshot, model)
+    finally:
+        _ai_state["running"] = False  # garante reset mesmo em caso de exceção
+
+# Chama imediatamente se chegaram muitos logs novos (ataque) ou a cada 15s no normal
 should_call = (
-    gemini_key
+    qwen_model
     and estado == "NORMAL"
-    and (elapsed_gemini >= 15 or new_logs_delta > 8)
+    and (elapsed_qwen >= 15 or new_logs_delta > 8)
 )
 if should_call:
-    st.session_state.gemini_result = analisar_com_gemini(logs, gemini_key)
-    st.session_state.last_gemini_call = now
+    with _ai_lock:
+        if not _ai_state["running"]:   # double-check sob o lock evita threads duplicadas
+            _ai_state["running"]   = True
+            _ai_state["last_call"] = now
+            threading.Thread(
+                target=_run_qwen_bg,
+                args=(list(logs), qwen_model),
+                daemon=True,
+            ).start()
 
 # ── overlay fullscreen ───────────────────────────────────────────────────────
 if estado == "ATAQUE":
@@ -249,8 +300,10 @@ with col_chart:
 
 with col_badge:
     st.subheader("Análise da IA")
-    result = st.session_state.gemini_result
-    if "ATAQUE" in result:
+    result = st.session_state.qwen_result
+    if _ai_state["running"]:
+        st.info("⏳ Analisando...")
+    elif "ATAQUE" in result:
         st.error(f"🤖 {result}")
     elif "FALSO_POSITIVO" in result:
         st.warning(f"🤖 {result}")
@@ -259,8 +312,7 @@ with col_badge:
     else:
         st.info("🤖 Monitorando...")
 
-    if not gemini_key:
-        st.caption("⚠️ IA desativada\nDefina a chave no painel de controle")
+    st.caption(f"Modelo: {qwen_model}")
 
 st.divider()
 

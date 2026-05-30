@@ -1,6 +1,20 @@
 # Como Rodar a Demo de Cibersegurança
 
-## 1. Instalar dependências
+## 1. Configurar o LM Studio
+
+1. Baixe e instale o [LM Studio](https://lmstudio.ai)
+2. Na aba **Discover**, pesquise por `Qwen2.5` e baixe o modelo desejado
+   - Recomendado: `Qwen2.5-7B-Instruct` (bom equilíbrio entre velocidade e qualidade)
+   - Máquinas com pouca RAM: `Qwen2.5-3B-Instruct`
+   - Mais precisão: `Qwen2.5-14B-Instruct`
+3. Vá em **Local Server** (ícone `<->` na barra lateral)
+4. Selecione o modelo Qwen na lista e clique em **Start Server**
+
+O servidor sobe em `http://localhost:1234` por padrão.
+
+---
+
+## 2. Instalar dependências Python
 
 ```bash
 pip install -r requirements.txt
@@ -8,25 +22,29 @@ pip install -r requirements.txt
 
 ---
 
-## 2. Definir variáveis de ambiente
+## 3. Variáveis de ambiente (todas opcionais)
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `QWEN_MODEL` | `qwen2.5-7b-instruct` | Identificador do modelo carregado no LM Studio |
+| `LMSTUDIO_BASE_URL` | `http://localhost:1234/v1` | LM Studio em outra máquina |
+| `API_URL` | `http://localhost:8000` | API em outra máquina |
 
 **Mac / Linux**
 ```bash
-export GEMINI_API_KEY="sua-chave-aqui"
+export QWEN_MODEL="qwen2.5-14b-instruct"
 ```
 
 **Windows (PowerShell)**
 ```powershell
-$env:GEMINI_API_KEY = "sua-chave-aqui"
+$env:QWEN_MODEL = "qwen2.5-14b-instruct"
 ```
 
-A chave do Gemini é **obrigatória** para o núcleo do sistema funcionar — é a IA quem decide se há ataque ou não. Sem ela, o dashboard monitora os logs mas não aciona alertas.
-
-A variável `API_URL` é opcional (padrão: `http://localhost:8000`). Defina-a no terminal do `controle.py` se rodar em máquina diferente da API.
+> O modelo também pode ser alterado diretamente pelo painel de controle durante a apresentação, sem reiniciar os serviços.
 
 ---
 
-## 3. Rodar os 3 servidores (um terminal cada)
+## 4. Rodar os 3 servidores (um terminal cada)
 
 **Terminal 1 — API (backend)**
 ```bash
@@ -48,7 +66,7 @@ Acesse pelo celular: http://IP_DA_MAQUINA:8502
 
 ---
 
-## 4. Descobrir o IP da máquina
+## 5. Descobrir o IP da máquina
 
 **Mac / Linux**
 ```bash
@@ -66,12 +84,12 @@ O celular e o notebook precisam estar na **mesma rede Wi-Fi**.
 
 ---
 
-## 5. Ordem da demonstração ao vivo
+## 6. Ordem da demonstração ao vivo
 
 ### Fluxo 1 — Ataque detectado
 1. Abra o dashboard no projetor — logs chegando, gráfico se movendo, badge "🤖 IA: Monitorando..."
 2. No celular, acesse http://IP_DA_MAQUINA:8502 e clique **"💣 SIMULAR ATAQUE"**
-3. A API injeta 50 logs de força bruta. O Gemini detecta e chama `/set-state`
+3. A API injeta 50 logs de força bruta. O Qwen detecta e chama `/set-state`
 4. O dashboard exibe o overlay vermelho piscando com IP bloqueado
 5. Explique para a plateia que foi a IA quem tomou a decisão, não uma regra hardcoded
 
@@ -82,13 +100,13 @@ O celular e o notebook precisam estar na **mesma rede Wi-Fi**.
 ### Fluxo 2 — Falso positivo
 1. Explique o conceito de falso positivo para a plateia
 2. Clique **"👤 SIMULAR FALSO POSITIVO"** — aguarde ~6 segundos
-3. O Gemini analisa os 3 tentativas esparsas e (idealmente) classifica como FALSO_POSITIVO
+3. O Qwen analisa as 3 tentativas esparsas e classifica como FALSO_POSITIVO
 4. Overlay laranja aparece com a mensagem sobre comportamento humano
 5. Demonstre que o sistema distingue bots de humanos
 
 ---
 
-## 6. Se der erro
+## 7. Se der erro
 
 ### Porta já em uso
 ```bash
@@ -114,15 +132,14 @@ sudo firewall-cmd --add-port=8502/tcp --permanent
 sudo firewall-cmd --reload
 ```
 
-### Gemini retornando erro de cota (429)
-O plano gratuito tem limite de requisições por dia. O dashboard chama a IA a cada 4 segundos em estado normal — use com moderação antes da apresentação.
+### LM Studio / Qwen com problema
 
-| Mensagem              | Solução                                                        |
-|-----------------------|----------------------------------------------------------------|
-| `429 quota exceeded`  | Aguarde reset diário ou ative billing no Google Cloud          |
-| `API_KEY_INVALID`     | Verifique se a chave foi copiada sem espaços extras            |
-| `model not found`     | O modelo é `gemini-2.5-flash` — confirme acesso na sua chave  |
-| Timeout               | Verifique conexão com a internet                               |
+| Mensagem | Solução |
+|---|---|
+| `Connection refused` | Verifique se o servidor local do LM Studio está iniciado |
+| `model not found` | Confirme que o identificador do modelo no painel bate com o carregado no LM Studio |
+| Resposta muito lenta | Use `Qwen2.5-3B` ou ative aceleração de GPU nas configurações do LM Studio |
+| JSON inválido na resposta | Use um modelo maior (`Qwen2.5-14B`) para mais precisão |
 
 ---
 

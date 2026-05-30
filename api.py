@@ -27,8 +27,8 @@ system_state: dict = {
     "mensagem": "",
 }
 
-# Chave do Gemini armazenada em memória (definida pelo controle.py)
-gemini_api_key: str = ""
+# Modelo Qwen (LM Studio) armazenado em memória (definido pelo controle.py)
+qwen_model: str = "qwen/qwen3-4b-thinking-2507"
 
 FAKE_IPS = [
     "203.0.113.5",  "198.51.100.22", "192.0.2.17",    "45.33.32.156",
@@ -86,17 +86,17 @@ def get_status() -> dict:
     return system_state
 
 
-# ── Gemini key gerenciada pela API ──────────────────────────────────────────
-@app.get("/set-gemini-key")
-def set_gemini_key(key: str = Query(...)) -> dict:
-    global gemini_api_key
-    gemini_api_key = key
+# ── Modelo Qwen gerenciado pela API ─────────────────────────────────────────
+@app.get("/set-qwen-model")
+def set_qwen_model(model: str = Query(...)) -> dict:
+    global qwen_model
+    qwen_model = model
     return {"ok": True}
 
 
-@app.get("/get-gemini-key")
-def get_gemini_key() -> dict:
-    return {"key": gemini_api_key}
+@app.get("/get-qwen-model")
+def get_qwen_model() -> dict:
+    return {"model": qwen_model}
 
 
 # ── Estado definido pela IA ─────────────────────────────────────────────────
